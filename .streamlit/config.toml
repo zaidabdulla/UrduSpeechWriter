@@ -1,0 +1,6 @@
+[server]
+# Disable file watcher to avoid inotify EMFILE errors on Cloud
+fileWatcherType = "none"
+headless = true
+port = $PORT
+enableCORS = false
