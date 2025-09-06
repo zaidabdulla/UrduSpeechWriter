@@ -1,12 +1,13 @@
 import streamlit as st
 import requests
-import base64
+import io
+from pydub import AudioSegment
+import os
 import json
 import datetime
-import time
-from dotenv import load_dotenv
-import os
 from difflib import ndiff
+from dotenv import load_dotenv
+import speech_recognition as sr
 
 # ---------- Config ----------
 load_dotenv()
@@ -22,82 +23,27 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ---------- Helper Functions ----------
-def encode_audio(audio_bytes):
-    """Convert audio bytes to base64"""
-    return base64.b64encode(audio_bytes).decode("utf-8")
-
-def transcribe_audio_openrouter(audio_bytes, retries=2, timeout_sec=60):
-    """Send audio to OpenRouter for transcription"""
-    encoded_audio = encode_audio(audio_bytes)
-    messages = [
-        {"role": "system", "content": "You are a transcription assistant."},
-        {"role": "user", "content": [{"type": "input_audio", "input_audio": {"audio": encoded_audio, "format": "audio/webm"}}]}
-    ]
-    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
-    payload = {"model": MODEL, "messages": messages}
-
-    for attempt in range(retries):
-        try:
-            with st.spinner(f"Transcribing audio… (attempt {attempt+1})"):
-                resp = requests.post(BASE_URL, headers=headers, json=payload, timeout=timeout_sec)
-            if resp.status_code == 200:
-                return resp.json()["choices"][0]["message"]["content"].strip()
-            else:
-                st.warning(f"API returned status {resp.status_code}: {resp.text}")
-        except requests.exceptions.Timeout:
-            st.warning("Request timed out. Retrying…")
-            time.sleep(2)
-    return "❌ Failed to transcribe audio."
-
-def translate_to_urdu(text, retries=2, timeout_sec=60):
+def openrouter_translate_to_urdu(text: str, retries=2, timeout_sec=60) -> str:
     headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": MODEL,
         "messages": [
             {"role": "system", "content": "Translate the following text into Urdu."},
-            {"role": "user", "content": text}
-        ]
+            {"role": "user", "content": text},
+        ],
     }
     for attempt in range(retries):
         try:
             with st.spinner(f"Translating to Urdu… (attempt {attempt+1})"):
-                resp = requests.post(BASE_URL, headers=headers, json=payload, timeout=timeout_sec)
-            if resp.status_code == 200:
-                return resp.json()["choices"][0]["message"]["content"].strip()
+                response = requests.post(BASE_URL, headers=headers, json=payload, timeout=timeout_sec)
+            data = response.json()
+            if "choices" in data:
+                return data["choices"][0]["message"]["content"].strip()
         except requests.exceptions.Timeout:
             st.warning("Request timed out. Retrying…")
-            time.sleep(2)
-    return "❌ Failed to translate."
-
-def proofread_urdu(urdu_text, source_text="", retries=2, timeout_sec=60):
-    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
-    sys_prompt = (
-        "You are an Urdu copyeditor. Correct spelling, spacing, punctuation, "
-        "and obvious word errors, but keep the user's meaning. "
-        "Return ONLY valid JSON with keys: corrected (string), changes (array of objects with from,to,reason)."
-    )
-    user_prompt = (
-        f"Original Urdu:\n{urdu_text}\n\nReference text:\n{source_text}\n\n"
-        "Return JSON like:\n"
-        '{"corrected":"...", "changes":[{"from":"غلط","to":"صحیح","reason":"typo"}]}'
-    )
-    payload = {"model": MODEL, "messages":[{"role":"system","content":sys_prompt},{"role":"user","content":user_prompt}]}
-
-    for attempt in range(retries):
-        try:
-            with st.spinner(f"Proofreading Urdu… (attempt {attempt+1})"):
-                resp = requests.post(BASE_URL, headers=headers, json=payload, timeout=timeout_sec)
-            if resp.status_code == 200:
-                text = resp.json()["choices"][0]["message"]["content"]
-                try:
-                    result = json.loads(text)
-                    return result.get("corrected", ""), result.get("changes", [])
-                except Exception:
-                    return text, []
-        except requests.exceptions.Timeout:
-            st.warning("Request timed out. Retrying…")
-            time.sleep(2)
-    return None, []
+        except Exception as e:
+            st.warning(f"API Error: {e}")
+    return "❌ Failed to get translation after retries."
 
 def diff_text(old: str, new: str) -> str:
     diff = ndiff(old.split(), new.split())
@@ -107,56 +53,89 @@ def diff_text(old: str, new: str) -> str:
             out.append(f"**{token[2:]}**")
         elif token.startswith("- "):
             out.append(f"~~{token[2:]}~~")
+        elif token.startswith("? "):
+            continue
         else:
-            out.append(token[2:] if token.startswith("  ") else token)
+            out.append(token[2:])
     return " ".join(out)
 
-# ---------- Main ----------
+# ---------- Main Function ----------
 def main():
+    # Session state initialization
     if "original_urdu" not in st.session_state:
         st.session_state.original_urdu = ""
     if "urdu_edit" not in st.session_state:
         st.session_state.urdu_edit = ""
-    if "last_source" not in st.session_state:
-        st.session_state.last_source = ""
 
-    st.title("🎤 Urdu Speech Writer (Cloud Compatible)")
+    st.title("🎤 Urdu Speech Writer")
+    st.caption("Upload → transcribe → translate → edit → replace → save.")
 
-    # ---------- Sidebar ----------
+    # ---------- Sidebar Settings ----------
     with st.sidebar:
         st.subheader("Settings")
+        # Speech language selection
+        speech_lang = st.selectbox(
+            "Speech language (for recognition)",
+            [("Urdu (Pakistan)", "ur-PK"), ("Hindi (India)", "hi-IN"), ("English (US)", "en-US")],
+            index=0,
+            format_func=lambda x: x[0]
+        )[1]
+
+        # Urdu font selection
         urdu_font = st.selectbox(
             "Choose Urdu font",
             ["Noto Nastaliq Urdu", "Jameel Noori Nastaleeq", "Scheherazade", "Alvi Nastaleeq"]
         )
 
-    # ---------- Audio Capture ----------
-    audio_data = st.audio_input("Record your voice…")
-    if audio_data:
-        audio_bytes = audio_data.getbuffer()
-        source_text = transcribe_audio_openrouter(audio_bytes)
-        if source_text.startswith("❌"):
-            st.error(source_text)
-        else:
-            st.success(f"Recognized: {source_text}")
+    # ---------- Audio Upload ----------
+    audio_file = st.file_uploader("Upload your recorded audio (wav/webm):", type=["wav", "webm"])
+    if audio_file:
+        audio_bytes = audio_file.read()
+        try:
+            audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format="wav")
+        except:
+            try:
+                audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format="webm")
+            except Exception as e:
+                st.error(f"❌ Could not decode audio: {e}")
+                st.stop()
 
-            if not st.session_state.original_urdu:
-                urdu_text = translate_to_urdu(source_text)
-                st.session_state.original_urdu = urdu_text
-                st.session_state.urdu_edit = urdu_text
-                st.session_state.last_source = source_text
+        wav_io = io.BytesIO()
+        audio.export(wav_io, format="wav")
+        wav_io.seek(0)
 
-                # Append to file
-                timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        recognizer = sr.Recognizer()
+        try:
+            with sr.AudioFile(wav_io) as source:
+                audio_content = recognizer.record(source)
+            source_text = recognizer.recognize_google(audio_content, language=speech_lang)
+            st.success(f"Recognized ({speech_lang}): {source_text}")
+        except Exception as e:
+            st.error(f"❌ Speech Recognition Error: {e}")
+            st.stop()
+
+        # Translate once
+        if not st.session_state.original_urdu:
+            urdu = openrouter_translate_to_urdu(source_text)
+            st.session_state.original_urdu = urdu
+            st.session_state.urdu_edit = urdu
+
+            # Append to file
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            try:
                 with open("urdu_output.html", "a", encoding="utf-8") as f:
-                    f.write(f"<p><strong>Time: {timestamp}</strong></p>{st.session_state.urdu_edit}<hr>")
+                    f.write(f"<div><strong>Time: {timestamp}</strong></div>\n")
+                    f.write(f"<div>{urdu}</div>\n<hr>\n")
+                st.info(f"Saved speech automatically at {timestamp}")
+            except Exception as e:
+                st.warning(f"Could not save automatically: {e}")
 
-    # ---------- Editable Text ----------
+    # ---------- Editable Urdu text ----------
     st.subheader("📝 Urdu Output")
-    st.text_area("Edit Urdu text:", value=st.session_state.urdu_edit, height=180, key="urdu_edit")
+    st.text_area("Edit Urdu text here:", value=st.session_state.urdu_edit, height=180, key="urdu_edit")
 
     # ---------- Live Font Preview ----------
-    st.subheader("📖 Live Preview")
+    st.subheader("📖 Live Preview in Selected Font")
     st.markdown(f"""
     <div style="font-family: '{urdu_font}', serif; font-size: 22px; line-height:1.6; border:1px solid #ddd; padding:10px; border-radius:5px;">
     {st.session_state.urdu_edit}
@@ -169,42 +148,37 @@ def main():
     with st.form(key="replace_form"):
         old_word = st.text_input("Word to replace:")
         new_word = st.text_input("Replace with:")
-        submit_replace = st.form_submit_button("Replace")
+        submit_replace = st.form_submit_button("Replace Word")
         if submit_replace:
-            if old_word.strip() and new_word.strip():
+            if old_word.strip() == "" or new_word.strip() == "":
+                st.warning("Both fields must be filled.")
+            else:
                 st.session_state.urdu_edit = st.session_state.urdu_edit.replace(old_word, new_word)
-                st.success(f"Replaced '{old_word}' with '{new_word}'.")
+                st.success(f"Replaced '{old_word}' with '{new_word}'!")
 
-    # ---------- Buttons ----------
-    col1, col2, col3 = st.columns([1,1,1])
+    # ---------- Save and Clear ----------
+    col1, col2 = st.columns([1,1])
     with col1:
         if st.button("💾 Save Live Preview"):
-            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            html_content = f"""
-            <div style="font-family: '{urdu_font}', serif; font-size:22px; line-height:1.6;">
-            <p><strong>Time: {timestamp}</strong></p>
-            {st.session_state.urdu_edit}
-            </div><hr>
-            """
-            with open("urdu_output.html", "a", encoding="utf-8") as f:
-                f.write(html_content)
-            st.success(f"Saved live preview at {timestamp}")
+            try:
+                timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                html_content = f"""
+                <div style="font-family: '{urdu_font}', serif; font-size:22px; line-height:1.6;">
+                <p><strong>Time: {timestamp}</strong></p>
+                {st.session_state.urdu_edit}
+                </div>
+                <hr>
+                """
+                with open("urdu_output.html", "a", encoding="utf-8") as f:
+                    f.write(html_content)
+                st.success(f"Live preview appended to urdu_output.html at {timestamp}")
+            except Exception as e:
+                st.warning(f"Could not save: {e}")
 
     with col2:
-        if st.button("🔎 Proofread Urdu"):
-            corrected, changes = proofread_urdu(st.session_state.urdu_edit, st.session_state.last_source)
-            if corrected:
-                st.markdown("**Corrected Urdu:**")
-                st.write(corrected)
-                st.markdown("**Diff view:**")
-                st.markdown(diff_text(st.session_state.urdu_edit, corrected))
-                st.session_state.urdu_edit = corrected
-
-    with col3:
-        if st.button("🧹 Clear"):
+        if st.button("🧹 Clear All"):
             st.session_state.original_urdu = ""
             st.session_state.urdu_edit = ""
-            st.session_state.last_source = ""
             st.experimental_rerun()
 
 # ---------- Run ----------
