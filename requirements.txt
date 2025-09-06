@@ -4,8 +4,8 @@ requests==2.31.0
 python-dotenv==1.0.0
 
 # Speech recognition & audio processing
-SpeechRecognition==3.8.1
-pydub==0.25.1
+#SpeechRecognition==3.8.1
+#pydub==0.25.1
 
 # Optional helpers (diffing, JSON handling)
 json5==0.9.14
@@ -13,3 +13,4 @@ json5==0.9.14
 # For better font rendering and HTML display in Streamlit (optional)
 html5lib==1.1
 beautifulsoup4==4.12.2
+
